@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coving cutting planner</title>
+<style>
+  :root { --ink:#1f1f1c; --muted:#6e6e68; --wall:#0f6e56; --band:#e1f5ee; --bg:#f6f5f1; --panel:#fff; --rule:#d9d6cf; --blade:#d85a30; --error:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  header, main { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+  header { padding-top: 24px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  header p { margin: 0 0 16px; color: var(--muted); font-size: 14px; line-height: 1.45; }
+  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 12px; margin-bottom: 20px; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom: 10px; }
+  button { font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--rule); background: #fff; color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--wall); }
+  button.primary { background: var(--wall); color:#fff; border-color: var(--wall); }
+  label { font-size: 13px; display:flex; gap:6px; align-items:center; }
+  #draw { display:block; width:100%; height:auto; background:#fff; border:1px solid var(--rule); border-radius:6px; cursor: crosshair; touch-action: none; }
+  #status { font-size: 13px; color: var(--muted); margin: 8px 0 0; min-height: 1.2em; }
+  #status.error { color: var(--error); }
+  #corners { margin-bottom: 12px; }
+  .corners-head { font-size: 13px; color: var(--muted); margin: 0 0 8px; }
+  .corner-list { display:flex; flex-wrap:wrap; gap:8px; margin-bottom: 8px; }
+  .corner { border:1px solid var(--rule); border-radius:6px; padding:6px 8px; font-size:12px; display:flex; flex-direction:column; gap:4px; }
+  .corner .who { color: var(--muted); }
+  .corner input { width: 64px; font: inherit; font-size: 13px; padding: 3px 6px; border:1px solid var(--rule); border-radius:4px; margin-right: 3px; }
+  .corner.typed { border-color: var(--blade); }
+  .corner.typed input { font-weight: 600; color: var(--blade); border-color: var(--blade); }
+  #plan svg { width: 100%; height: auto; display:block; }
+  #output[hidden] { display:none; }
+  @media print {
+    header, #editor, #output .toolbar, #corners { display:none; }
+    body { background:#fff; }
+    .panel { border:0; padding:0; margin:0; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Coving cutting planner</h1>
+  <p>Click the corners of your room on the grid, going round in order. Click the first corner again (or press Enter) to close the shape.
+     The plan, the cutting table and the saw setups appear underneath. Corners only need to be roughly right: once the shape is closed
+     you can type the measured angle of any corner. Backspace undoes, Escape clears.</p>
+</header>
+<main>
+  <section id="editor" class="panel">
+    <div class="toolbar">
+      <button id="undo" type="button">Undo</button>
+      <button id="clear" type="button">Clear</button>
+      <button id="close" type="button" class="primary">Close shape</button>
+      <label><input type="checkbox" id="ortho" checked> Right angles only</label>
+    </div>
+    <svg id="draw" viewBox="0 0 920 460" aria-label="Room drawing canvas"></svg>
+    <p id="status"></p>
+  </section>
+  <section id="output" class="panel" hidden>
+    <div class="toolbar">
+      <button id="download" type="button">Download SVG</button>
+      <button id="print" type="button">Print</button>
+    </div>
+    <div id="corners"></div>
+    <div id="plan"></div>
+  </section>
+</main>
+<script src="coving.js"></script>
+<script src="render.js"></script>
+<script src="editor.js"></script>
+<script>
+(function () {
+  const CANVAS = { w: 920, h: 460, grid: 20 };
+  const svg = document.getElementById('draw');
+  const statusEl = document.getElementById('status');
+  const planEl = document.getElementById('plan');
+  const cornersEl = document.getElementById('corners');
+  const outputEl = document.getElementById('output');
+  const orthoEl = document.getElementById('ortho');
+  const state = { points: [], closed: false, hover: null, svgText: '', wallAngles: {} };
+
+  function canvasPoint(evt) {
+    const r = svg.getBoundingClientRect();
+    return { x: (evt.clientX - r.left) * CANVAS.w / r.width, y: (evt.clientY - r.top) * CANVAS.h / r.height };
+  }
+  const last = () => state.points[state.points.length - 1] || null;
+  const snapped = evt => Editor.snapPoint(canvasPoint(evt), last(), CANVAS, orthoEl.checked);
+  const escapeHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+  function drawCanvas() {
+    const g = CANVAS.grid;
+    let s = '<defs><pattern id="grid" width="' + g + '" height="' + g + '" patternUnits="userSpaceOnUse">' +
+            '<path d="M ' + g + ' 0 L 0 0 0 ' + g + '" fill="none" stroke="#e6e3dc" stroke-width="1"/></pattern></defs>' +
+            '<rect width="' + CANVAS.w + '" height="' + CANVAS.h + '" fill="url(#grid)"/>';
+    const pts = state.points.map(p => p.x + ',' + p.y).join(' ');
+    if (state.closed) {
+      s += '<polygon points="' + pts + '" fill="#e1f5ee" stroke="#0f6e56" stroke-width="2"/>';
+    } else if (state.points.length) {
+      s += '<polyline points="' + pts + '" fill="none" stroke="#0f6e56" stroke-width="2"/>';
+      if (state.hover) {
+        const l = last();
+        s += '<line x1="' + l.x + '" y1="' + l.y + '" x2="' + state.hover.x + '" y2="' + state.hover.y + '" stroke="#0f6e56" stroke-width="1.5" stroke-dasharray="4 4"/>';
+      }
+    }
+    state.points.forEach((p, i) => {
+      const closable = i === 0 && !state.closed && state.points.length >= 3;
+      s += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (closable ? 7 : 4) + '" fill="' + (closable ? '#fff' : '#0f6e56') + '" stroke="#0f6e56" stroke-width="2"/>';
+    });
+    if (state.hover && !state.closed) {
+      s += '<circle cx="' + state.hover.x + '" cy="' + state.hover.y + '" r="4" fill="none" stroke="#d85a30" stroke-width="1.5"/>';
+    }
+    svg.innerHTML = s;
+  }
+
+  function setStatus(msg, isError) { statusEl.textContent = msg; statusEl.className = isError ? 'error' : ''; }
+
+  function renderCorners(room) {
+    const n = room.corners.length;
+    const anyTyped = room.corners.some(c => c.typed);
+    cornersEl.innerHTML =
+      '<p class="corners-head">Corner angles, wall to wall as you would measure them. Type over any corner that is not square and the mitre updates for both cuts there.</p>' +
+      '<div class="corner-list">' +
+      room.corners.map(c =>
+        '<label class="corner' + (c.typed ? ' typed' : '') + '">' +
+          '<span class="who">' + escapeHtml(Editor.cornerLabel(c.index, n)) + ' · ' + c.type + '</span>' +
+          '<span><input type="number" min="1" max="179" step="0.5" value="' + c.wallAngle + '" ' +
+            'data-key="' + Editor.pointKey(c.point) + '" data-default="' + c.drawnWallAngle + '" aria-label="' + escapeHtml(Editor.cornerLabel(c.index, n)) + '">°</span>' +
+        '</label>').join('') +
+      '</div>' +
+      (anyTyped ? '<button type="button" id="reset-angles">Reset to drawn angles</button>' : '');
+  }
+
+  function compute() {
+    try {
+      const normalized = Coving.normalizeRoom(state.points);
+      const room = Coving.analyzeRoom(state.points, undefined, { wallAngles: Editor.overridesFor(normalized, state.wallAngles) });
+      state.svgText = Render.renderPlan(room);
+      planEl.innerHTML = state.svgText;
+      renderCorners(room);
+      outputEl.hidden = false;
+      const ext = room.corners.filter(c => c.type === 'external').length;
+      const typed = room.corners.filter(c => c.typed).length;
+      setStatus(room.pieces.length + ' pieces, ' + room.angles.length + ' cuts' +
+        (ext ? ', ' + ext + ' external corner' + (ext > 1 ? 's' : '') : '') +
+        (typed ? ', ' + typed + ' typed angle' + (typed > 1 ? 's' : '') : '') + '. Undo reopens the shape.');
+    } catch (e) {
+      hideOutput();
+      setStatus(e.message, true);
+    }
+  }
+
+  function hideOutput() { outputEl.hidden = true; planEl.innerHTML = ''; cornersEl.innerHTML = ''; state.svgText = ''; }
+
+  function closeShape() {
+    if (state.closed || state.points.length < 3) return;
+    state.closed = true;
+    state.hover = null;
+    drawCanvas();
+    compute();
+  }
+
+  function addPoint(p) {
+    if (state.closed) return;
+    if (Editor.isCloseClick(p, state.points)) return closeShape();
+    const l = last();
+    if (l && l.x === p.x && l.y === p.y) return;
+    state.points.push(p);
+    drawCanvas();
+    setStatus(state.points.length < 3 ? 'Keep clicking corners.' : 'Click the first corner (or press Enter) to close the shape.');
+  }
+
+  function undo() {
+    if (state.closed) { state.closed = false; hideOutput(); }
+    else state.points.pop();
+    drawCanvas();
+    setStatus(state.points.length ? 'Keep clicking corners.' : 'Click to place the first corner.');
+  }
+
+  function clearAll() {
+    state.points = []; state.closed = false; state.hover = null; state.wallAngles = {};
+    hideOutput(); drawCanvas(); setStatus('Click to place the first corner.');
+  }
+
+  function loadExample(name) {
+    state.points = Editor.EXAMPLES[name].map(p => ({ x: p[0], y: p[1] }));
+    state.closed = false;
+    state.wallAngles = {};
+    closeShape();
+  }
+
+  svg.addEventListener('pointermove', e => { if (state.closed) return; state.hover = snapped(e); drawCanvas(); });
+  svg.addEventListener('pointerleave', () => { state.hover = null; drawCanvas(); });
+  svg.addEventListener('pointerdown', e => { if (e.button !== 0) return; e.preventDefault(); addPoint(snapped(e)); });
+  document.getElementById('undo').onclick = undo;
+  document.getElementById('clear').onclick = clearAll;
+  document.getElementById('close').onclick = closeShape;
+  document.getElementById('print').onclick = () => window.print();
+  document.getElementById('download').onclick = () => {
+    const blob = new Blob([state.svgText], { type: 'image/svg+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'coving-cutting-plan.svg';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  cornersEl.addEventListener('change', e => {
+    const input = e.target.closest('input[data-key]');
+    if (!input) return;
+    const key = input.dataset.key;
+    if (!Editor.setWallAngle(state.wallAngles, key, input.value, Number(input.dataset.default))) {
+      setStatus('Corner angles must be between 0 and 180 degrees.', true);
+      input.value = state.wallAngles[key] != null ? state.wallAngles[key] : input.dataset.default;
+      return;
+    }
+    compute();
+  });
+  cornersEl.addEventListener('click', e => {
+    if (e.target.id === 'reset-angles') { state.wallAngles = {}; compute(); }
+  });
+  document.addEventListener('keydown', e => {
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === 'Enter' && tag !== 'BUTTON') closeShape();
+    else if (e.key === 'Backspace') { e.preventDefault(); undo(); }
+    else if (e.key === 'Escape') clearAll();
+  });
+
+  const hash = location.hash.replace('#', '');
+  if (Editor.EXAMPLES[hash]) loadExample(hash);
+  else { drawCanvas(); setStatus('Click to place the first corner.'); }
+})();
+</script>
+</body>
+</html>
